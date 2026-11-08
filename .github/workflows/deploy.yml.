@@ -1,0 +1,139 @@
+
+name: Deploy to GitHub Pages (from ZIP)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.mode.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: mode
+        name: Check for one project ZIP
+        run: |
+          shopt -s nullglob
+          zips=(./*.zip)
+
+          if [ -f package.json ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Source project detected. ZIP workflow skipping."
+          elif [ "${#zips[@]}" -eq 0 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No project ZIP found yet."
+          elif [ "${#zips[@]}" -gt 1 ]; then
+            echo "::error::Keep exactly one ZIP in the repository root."
+            exit 1
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          set -eu
+          shopt -s nullglob
+          zips=(./*.zip)
+
+          rm -rf _unpacked project
+          mkdir _unpacked
+          unzip -q "${zips[0]}" -d _unpacked
+
+          PKG=$(find _unpacked -maxdepth 3 \
+            -name package.json \
+            -not -path '*/node_modules/*' \
+            -not -path '*/__MACOSX/*' \
+            | awk -F/ '{print NF, $0}' \
+            | sort -n \
+            | sed -n '1p' \
+            | cut -d' ' -f2-)
+
+          if [ -z "$PKG" ]; then
+            echo "::error::package.json not found in ZIP"
+            exit 1
+          fi
+
+          DIR=$(dirname "$PKG")
+          mv "$DIR" project
+
+          test -f project/package-lock.json
+          test -d project/src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: project
+        run: npm ci
+
+      - name: Build project
+        working-directory: project
+        run: npm run build
+
+      - name: Verify production output
+        working-directory: project
+        run: |
+          set -eu
+
+          test -s dist/index.html || {
+            echo "::error::dist/index.html missing or empty"
+            exit 1
+          }
+
+          grep -q 'id="root"' dist/index.html || {
+            echo "::error::React root element missing"
+            exit 1
+          }
+
+          if grep -Eq '<(script|link)[^>]* (src|href)="/[^/]' dist/index.html; then
+            echo "::error::Root-absolute asset path found"
+            exit 1
+          fi
+
+          if grep -q "Stage Audit" dist/index.html ||
+             grep -q "Verified & Active" dist/index.html; then
+            echo "::error::Developer-only text found"
+            exit 1
+          fi
+
+          echo "Production output checks passed."
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: project/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
